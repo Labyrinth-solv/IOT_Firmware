@@ -2,9 +2,8 @@
 #include <WiFi.h>
 #include <PubSubClient.h>
 #include <Wire.h>
-#include <Adafruit_SHT31.h>
-#include <Adafruit_GFX.h>
-#include <Adafruit_SSD1306.h>
+#include <Adafruit_AHTX0.h>
+#include <Adafruit_BMP280.h>
 #include <ArduinoJson.h>
 #include <math.h>
 
@@ -16,28 +15,30 @@
 WiFiClient espClient;
 PubSubClient mqttClient(espClient);
 
-Adafruit_SHT31 sht31 = Adafruit_SHT31();
-Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, -1);
+// Cảm biến I2C phần cứng
+Adafruit_AHTX0 aht;
+Adafruit_BMP280 bmp;
 
-// Cờ kiểm tra phần cứng vật lý có đang cắm hay không
-bool hasRealSHT31 = false;
-bool hasRealOLED = false;
+// Cờ kiểm tra phần cứng vật lý có cắm hay không
+bool hasRealAHT = false;
+bool hasRealBMP = false;
 
-// Trạng thái cơ cấu chấp hành
-bool fanState = false;          // false = OFF, true = ON
-bool buzzerState = false;       // false = OFF, true = ON
-String controlMode = "AUTO";    // "AUTO" hoặc "MANUAL"
+// Trạng thái cơ cấu chấp hành (Relay 2 kênh) và cảm biến cửa
+bool fanState = false;            // Kênh 1: false = OFF, true = ON
+bool buzzerState = false;         // Kênh 2: false = OFF, true = ON
+bool isDoorOpen = false;          // false = Cửa đóng, true = Cửa mở
+String controlMode = "AUTO";      // "AUTO" hoặc "MANUAL"
 String currentRiskLevel = "SAFE"; // "SAFE", "WARNING", "HIGH_RISK"
 
 // Dữ liệu vi khí hậu hiện tại
 float currentTemperature = 24.0f;
 float currentHumidity = 60.0f;
-float currentGasPPM = 400.0f;
-float currentEMC = 12.5f;
+float currentPressure = 1013.2f;  // Áp suất khí quyển (hPa)
+float currentGasPPM = 400.0f;     // Nồng độ khí gas lên men (ppm)
+float currentEMC = 12.5f;         // Độ ẩm cân bằng hạt (%MC - TCVN)
 
 // Các bộ định thời (Non-blocking timers với millis)
 unsigned long lastTelemetryTime = 0;
-unsigned long lastDisplayTime = 0;
 unsigned long lastMqttRetryTime = 0;
 unsigned long lastStatusHeartbeatTime = 0;
 unsigned long samplingIntervalMs = DEFAULT_SAMPLING_INTERVAL_MS;
@@ -62,108 +63,70 @@ float calculateHalseyEMC(float tempC, float rhPercent) {
 }
 
 // =============================================================================
-// ĐIỀU KHIỂN CƠ CẤU CHẤP HÀNH VẬT LÝ (RELAY, BUZZER, 3 ĐÈN LED)
+// ĐIỀU KHIỂN MODULE RELAY 2 KÊNH (QUẠT THÔNG GIÓ & CÒI BÁO ĐỘNG 5V)
 // =============================================================================
 void setFanRelay(bool enable) {
   fanState = enable;
-  if (RELAY_ACTIVE_LEVEL == HIGH) {
-    digitalWrite(PIN_RELAY_FAN, enable ? HIGH : LOW);
+  if (RELAY_ACTIVE_LEVEL == LOW) {
+    digitalWrite(PIN_RELAY_FAN, enable ? LOW : HIGH); // LOW kích hoạt
   } else {
-    digitalWrite(PIN_RELAY_FAN, enable ? LOW : HIGH);
+    digitalWrite(PIN_RELAY_FAN, enable ? HIGH : LOW); // HIGH kích hoạt
   }
 }
 
-void setBuzzer(bool enable) {
+void setBuzzerRelay(bool enable) {
   buzzerState = enable;
-  digitalWrite(PIN_BUZZER, enable ? HIGH : LOW);
-}
-
-void updateRiskIndicators(const String& risk) {
-  currentRiskLevel = risk;
-  if (risk == "HIGH_RISK") {
-    digitalWrite(PIN_LED_GREEN, LOW);
-    digitalWrite(PIN_LED_YELLOW, LOW);
-    digitalWrite(PIN_LED_RED, HIGH);
-    setBuzzer(true);
-  } else if (risk == "WARNING") {
-    digitalWrite(PIN_LED_GREEN, LOW);
-    digitalWrite(PIN_LED_YELLOW, HIGH);
-    digitalWrite(PIN_LED_RED, LOW);
-    setBuzzer(false);
-  } else { // SAFE
-    digitalWrite(PIN_LED_GREEN, HIGH);
-    digitalWrite(PIN_LED_YELLOW, LOW);
-    digitalWrite(PIN_LED_RED, LOW);
-    setBuzzer(false);
+  if (RELAY_ACTIVE_LEVEL == LOW) {
+    digitalWrite(PIN_RELAY_BUZZER, enable ? LOW : HIGH); // LOW kích hoạt
+  } else {
+    digitalWrite(PIN_RELAY_BUZZER, enable ? HIGH : LOW); // HIGH kích hoạt
   }
 }
 
 // =============================================================================
-// CẬP NHẬT MÀN HÌNH OLED 0.96 INCH TẠI CỬA KHO
-// =============================================================================
-void updateOLEDDisplay() {
-  if (!hasRealOLED) return;
-
-  display.clearDisplay();
-  display.setTextSize(1);
-  display.setTextColor(SSD1306_WHITE);
-
-  // Dòng 1: Tiêu đề & Trạng thái kết nối
-  display.setCursor(0, 0);
-  display.print(DEVICE_ID);
-  display.print(mqttClient.connected() ? " [MQTT OK]" : " [OFFLINE]");
-
-  display.drawLine(0, 10, 128, 10, SSD1306_WHITE);
-
-  // Dòng 2: Nhiệt độ & Độ ẩm không khí
-  display.setCursor(0, 14);
-  display.printf("T: %.1f C  RH: %.1f%%", currentTemperature, currentHumidity);
-
-  // Dòng 3: Độ ẩm hạt ước tính EMC
-  display.setCursor(0, 26);
-  display.printf("EMC: %.1f%%MC [%s]", currentEMC, currentRiskLevel.c_str());
-
-  // Dòng 4: Nồng độ khí Gas MQ-135
-  display.setCursor(0, 38);
-  display.printf("Gas MQ-135: %.0f ppm", currentGasPPM);
-
-  // Dòng 5: Trạng thái Quạt thông gió
-  display.setCursor(0, 50);
-  display.printf("FAN: %s | %s", fanState ? "ON " : "OFF", controlMode.c_str());
-
-  display.display();
-}
-
-// =============================================================================
-// ĐỌC CẢM BIẾN (HỖ TRỢ TỰ ĐỘNG GIẢ LẬP AN TOÀN NẾU CHƯA CẮM PHẦN CỨNG)
+// ĐỌC CẢM BIẾN (HỖ TRỢ AHT20, BMP280, MQ-135, CẢM BIẾN CỬA HALL A3122)
 // =============================================================================
 void readSensors() {
-  if (hasRealSHT31) {
-    float t = sht31.readTemperature();
-    float h = sht31.readHumidity();
-    if (!isnan(t) && !isnan(h) && t >= -40.0f && t <= 125.0f && h >= 0.0f && h <= 100.0f) {
-      currentTemperature = round(t * 10.0f) / 10.0f;
-      currentHumidity = round(h * 10.0f) / 10.0f;
+  // 1. Đọc Cảm biến Nhiệt độ & Độ ẩm AHT20 (I2C 0x38)
+  if (hasRealAHT) {
+    sensors_event_t humidityEvent, tempEvent;
+    aht.getEvent(&humidityEvent, &tempEvent);
+    if (!isnan(tempEvent.temperature) && !isnan(humidityEvent.relative_humidity)) {
+      currentTemperature = round(tempEvent.temperature * 10.0f) / 10.0f;
+      currentHumidity = round(humidityEvent.relative_humidity * 10.0f) / 10.0f;
     }
   } else {
-    // Chế độ mô phỏng an toàn khi chưa cắm cảm biến vật lý
+    // Chế độ mô phỏng an toàn khi chưa cắm AHT20 vật lý
     currentTemperature = 24.2f + (random(-5, 6) / 10.0f);
     currentHumidity = 61.5f + (random(-8, 9) / 10.0f);
   }
 
-  // Đọc cảm biến khí Gas MQ-135 từ kênh ADC1 (GPIO 34)
+  // 2. Đọc Cảm biến Áp suất khí quyển BMP280 (I2C 0x76 / 0x77)
+  if (hasRealBMP) {
+    float p = bmp.readPressure() / 100.0F; // Pa đổi sang hPa
+    if (!isnan(p) && p > 300.0f && p < 1200.0f) {
+      currentPressure = round(p * 10.0f) / 10.0f;
+    }
+  } else {
+    currentPressure = 1013.2f + (random(-10, 11) / 10.0f);
+  }
+
+  // 3. Đọc Cảm biến chất lượng không khí & Gas lên men MQ-135 (ADC1 - GPIO 34)
   int rawADC = analogRead(PIN_MQ135_ANALOG);
   if (rawADC > 100) {
-    // Ước tính PPM tương đối từ điện áp ADC
     currentGasPPM = map(rawADC, 0, 4095, 300, 1200);
   } else {
     currentGasPPM = 405.0f + random(-10, 11);
   }
 
-  // Tính toán EMC theo Halsey
+  // 4. Đọc Cảm biến Cửa kho Hall A3122 (Digital Input - GPIO 27)
+  int doorVal = digitalRead(PIN_DOOR_SENSOR);
+  isDoorOpen = (doorVal == DOOR_STATE_OPEN_LOGIC);
+
+  // 5. Tính toán độ ẩm hạt Halsey EMC
   currentEMC = calculateHalseyEMC(currentTemperature, currentHumidity);
 
-  // Đánh giá mức rủi ro theo ngưỡng TCVN 8370
+  // 6. Đánh giá mức độ rủi ro theo quy chuẩn TCVN 8370:2018
   String evaluatedRisk = "SAFE";
   if (currentHumidity >= THRESHOLD_HUM_CRIT || currentTemperature >= THRESHOLD_TEMP_CRIT ||
       currentEMC >= THRESHOLD_EMC_CRIT || currentGasPPM >= THRESHOLD_GAS_CRIT) {
@@ -173,10 +136,17 @@ void readSensors() {
     evaluatedRisk = "WARNING";
   }
 
-  updateRiskIndicators(evaluatedRisk);
+  currentRiskLevel = evaluatedRisk;
 
-  // Vận hành tự chủ tại biên (Edge Autonomous Fallback - Mục 6.2):
-  // Khi ở chế độ AUTO, nếu rủi ro WARNING hoặc HIGH_RISK, quạt tự động BẬT
+  // Cảnh báo Còi (Relay Kênh 2): Tự động hú khi HIGH_RISK hoặc cảnh báo mở cửa
+  if (currentRiskLevel == "HIGH_RISK") {
+    setBuzzerRelay(true);
+  } else if (controlMode == "AUTO") {
+    setBuzzerRelay(false);
+  }
+
+  // Vận hành tự chủ quạt tại biên (Edge Autonomous Fallback):
+  // Khi ở chế độ AUTO, nếu rủi ro WARNING hoặc HIGH_RISK -> Tự động BẬT Quạt qua Relay Kênh 1
   if (controlMode == "AUTO") {
     if (evaluatedRisk == "WARNING" || evaluatedRisk == "HIGH_RISK") {
       setFanRelay(true);
@@ -192,12 +162,7 @@ void readSensors() {
 void sendStatusHeartbeat() {
   if (!mqttClient.connected()) return;
 
-#if ARDUINOJSON_VERSION_MAJOR >= 7
   JsonDocument doc;
-#else
-  StaticJsonDocument<512> doc;
-#endif
-
   doc["device_id"]  = DEVICE_ID;
   doc["state"]      = "ONLINE";
   doc["ip_address"] = WiFi.localIP().toString();
@@ -218,39 +183,44 @@ void sendTelemetry() {
   unsigned long nowSec = millis() / 1000;
   String msgId = "msg_esp_" + String(nowSec) + "_" + String(random(100, 999));
 
-#if ARDUINOJSON_VERSION_MAJOR >= 7
   JsonDocument doc;
-#else
-  StaticJsonDocument<768> doc;
-#endif
-
   doc["msg_id"]     = msgId;
   doc["device_id"]  = DEVICE_ID;
   doc["fw_version"] = FIRMWARE_VERSION;
   doc["timestamp"]  = millis();
 
-  // Metrics (Nhiệt độ, Độ ẩm không khí, Khí Gas, Độ ẩm hạt EMC)
-  JsonObject metrics = doc.createNestedObject("metrics");
-  JsonObject mTemp = metrics.createNestedObject("temperature");
+  // Metrics (Nhiệt độ, Độ ẩm không khí, Gas, EMC, Áp suất BMP280, Cửa kho)
+  JsonObject metrics = doc["metrics"].to<JsonObject>();
+  
+  JsonObject mTemp = metrics["temperature"].to<JsonObject>();
   mTemp["value"] = currentTemperature;
   mTemp["unit"]  = "C";
 
-  JsonObject mHum = metrics.createNestedObject("humidity_air");
+  JsonObject mHum = metrics["humidity_air"].to<JsonObject>();
   mHum["value"] = currentHumidity;
   mHum["unit"]  = "%RH";
 
-  JsonObject mGas = metrics.createNestedObject("gas_ppm");
+  JsonObject mGas = metrics["gas_ppm"].to<JsonObject>();
   mGas["value"] = currentGasPPM;
   mGas["unit"]  = "ppm";
 
-  JsonObject mEMC = metrics.createNestedObject("estimated_emc");
+  JsonObject mEMC = metrics["estimated_emc"].to<JsonObject>();
   mEMC["value"] = currentEMC;
   mEMC["unit"]  = "%MC";
 
+  JsonObject mPress = metrics["pressure"].to<JsonObject>();
+  mPress["value"] = currentPressure;
+  mPress["unit"]  = "hPa";
+
+  JsonObject mDoor = metrics["door_sensor"].to<JsonObject>();
+  mDoor["is_open"] = isDoorOpen;
+  mDoor["status"]  = isDoorOpen ? "OPEN" : "CLOSED";
+
   // Actuators & Risk Level
-  JsonObject actuators = doc.createNestedObject("actuators");
+  JsonObject actuators = doc["actuators"].to<JsonObject>();
   actuators["fan_state"]    = fanState ? "ON" : "OFF";
   actuators["buzzer_state"] = buzzerState ? "ON" : "OFF";
+  actuators["door_state"]   = isDoorOpen ? "OPEN" : "CLOSED";
   actuators["control_mode"] = controlMode;
   actuators["risk_level"]   = currentRiskLevel;
 
@@ -260,9 +230,12 @@ void sendTelemetry() {
   serializeJson(doc, buffer);
   mqttClient.publish(topicTelemetry.c_str(), buffer, false);
 
-  Serial.printf("📊 [Telemetry] T=%.1fC | RH=%.1f%% | EMC=%.1f%% | Gas=%.0f ppm | Fan=%s | Risk=%s\n",
-                currentTemperature, currentHumidity, currentEMC, currentGasPPM,
-                fanState ? "ON" : "OFF", currentRiskLevel.c_str());
+  Serial.printf("📊 [Telemetry] T=%.1fC | RH=%.1f%% | P=%.1fhPa | EMC=%.1f%% | Gas=%.0f | Door=%s | Fan=%s | Buzzer=%s | Risk=%s\n",
+                currentTemperature, currentHumidity, currentPressure, currentEMC, currentGasPPM,
+                isDoorOpen ? "OPEN" : "CLOSED",
+                fanState ? "ON" : "OFF",
+                buzzerState ? "ON" : "OFF",
+                currentRiskLevel.c_str());
 }
 
 // =============================================================================
@@ -276,12 +249,7 @@ void handleIncomingCommand(char* topic, byte* payload, unsigned int length) {
 
   Serial.printf("📥 [MQTT Command] Nhan lenh tu topic %s: %s\n", topic, jsonBuffer);
 
-#if ARDUINOJSON_VERSION_MAJOR >= 7
   JsonDocument cmdDoc;
-#else
-  StaticJsonDocument<512> cmdDoc;
-#endif
-
   DeserializationError error = deserializeJson(cmdDoc, jsonBuffer);
   if (error) {
     Serial.println("❌ [MQTT] Giai ma JSON lenh that bai!");
@@ -301,13 +269,24 @@ void handleIncomingCommand(char* topic, byte* payload, unsigned int length) {
 
     if (mode) controlMode = String(mode);
 
+    // 1. Điều khiển Quạt thông gió (Relay Kênh 1 - GPIO 26)
     if (!target || strcmp(target, "VENTILATION_FAN") == 0) {
       if (action && strcmp(action, "TURN_ON") == 0) {
         setFanRelay(true);
-        ackMessage = "Relay GPIO 26 switched HIGH (Quat thong gio BAT)";
+        ackMessage = "Relay K1 GPIO 26 activated (Quat thong gio BAT)";
       } else if (action && strcmp(action, "TURN_OFF") == 0) {
         setFanRelay(false);
-        ackMessage = "Relay GPIO 26 switched LOW (Quat thong gio TAT)";
+        ackMessage = "Relay K1 GPIO 26 deactivated (Quat thong gio TAT)";
+      }
+    }
+    // 2. Điều khiển Còi báo động (Relay Kênh 2 - GPIO 25)
+    else if (strcmp(target, "ALARM_BUZZER") == 0) {
+      if (action && strcmp(action, "TURN_ON") == 0) {
+        setBuzzerRelay(true);
+        ackMessage = "Relay K2 GPIO 25 activated (Coi bao dong BAT)";
+      } else if (action && strcmp(action, "TURN_OFF") == 0) {
+        setBuzzerRelay(false);
+        ackMessage = "Relay K2 GPIO 25 deactivated (Coi bao dong TAT)";
       }
     }
   } else if (cmdType && strcmp(cmdType, "UPDATE_CONFIG") == 0) {
@@ -321,20 +300,16 @@ void handleIncomingCommand(char* topic, byte* payload, unsigned int length) {
   // Tự động phản hồi bản tin xác nhận /ack sau 300ms
   delay(300);
 
-#if ARDUINOJSON_VERSION_MAJOR >= 7
   JsonDocument ackDoc;
-#else
-  StaticJsonDocument<512> ackDoc;
-#endif
-
   ackDoc["cmd_id"]      = cmdId ? cmdId : "cmd_unknown";
   ackDoc["device_id"]   = DEVICE_ID;
   ackDoc["status"]      = "SUCCESS";
   ackDoc["executed_at"] = millis();
 
-  JsonObject currentActs = ackDoc.createNestedObject("current_actuators");
+  JsonObject currentActs = ackDoc["current_actuators"].to<JsonObject>();
   currentActs["fan_state"]    = fanState ? "ON" : "OFF";
   currentActs["buzzer_state"] = buzzerState ? "ON" : "OFF";
+  currentActs["door_state"]   = isDoorOpen ? "OPEN" : "CLOSED";
   currentActs["control_mode"] = controlMode;
 
   ackDoc["message"] = ackMessage;
@@ -344,7 +319,6 @@ void handleIncomingCommand(char* topic, byte* payload, unsigned int length) {
   mqttClient.publish(topicAck.c_str(), ackBuffer, false);
 
   Serial.printf("📤 [MQTT ACK] Da gui phan hoi ACK: %s\n", ackMessage.c_str());
-  updateOLEDDisplay();
 }
 
 // =============================================================================
@@ -412,51 +386,46 @@ void setup() {
   Serial.printf("Firmware v%s | Hardware: %s\n", FIRMWARE_VERSION, HARDWARE_VERSION);
   Serial.println("========================================================");
 
-  // 1. Cấu hình các chân GPIO cơ cấu chấp hành và LED
+  // 1. Cấu hình chân Relay 2 kênh và Cảm biến cửa
   pinMode(PIN_RELAY_FAN, OUTPUT);
-  pinMode(PIN_BUZZER, OUTPUT);
-  pinMode(PIN_LED_GREEN, OUTPUT);
-  pinMode(PIN_LED_YELLOW, OUTPUT);
-  pinMode(PIN_LED_RED, OUTPUT);
+  pinMode(PIN_RELAY_BUZZER, OUTPUT);
+  pinMode(PIN_DOOR_SENSOR, INPUT); // Chân cảm biến Hall A3122 (có trở kéo 10k về GND)
 
-  // Trạng thái ban đầu: Tắt quạt, tắt còi, bật LED Xanh (SAFE)
+  // Trạng thái ban đầu: Tắt Quạt, Tắt Còi
   setFanRelay(false);
-  setBuzzer(false);
-  updateRiskIndicators("SAFE");
+  setBuzzerRelay(false);
 
-  // 2. Khởi tạo Bus I2C
+  // 2. Khởi tạo Bus I2C (SDA=21, SCL=22)
   Wire.begin(PIN_I2C_SDA, PIN_I2C_SCL);
 
-  // 3. Khởi tạo Màn hình OLED SSD1306 (nếu có cắm)
-  if (display.begin(SSD1306_SWITCHCAPVCC, OLED_I2C_ADDR)) {
-    hasRealOLED = true;
-    display.clearDisplay();
-    display.setTextSize(1);
-    display.setTextColor(SSD1306_WHITE);
-    display.setCursor(10, 20);
-    display.println("Smart Grain IoT");
-    display.setCursor(10, 35);
-    display.println("TCVN 8370:2018");
-    display.display();
-    Serial.println("✅ [Hardware] Man hinh OLED 0.96 inch san sang!");
+  // 3. Khởi tạo Cảm biến AHT20 (Địa chỉ mặc định 0x38)
+  if (aht.begin()) {
+    hasRealAHT = true;
+    Serial.println("✅ [Hardware] Cam bien nhiet am AHT20 san sang (I2C 0x38)!");
   } else {
-    Serial.println("⚠️ [Hardware] Khong tim thay OLED I2C (Se bo qua hien thi tai cho).");
+    Serial.println("⚠️ [Hardware] Khong tim thay AHT20! Tu dong chay Che Do Gia Lap Test an toan.");
   }
 
-  // 4. Khởi tạo Cảm biến SHT31 (nếu có cắm)
-  if (sht31.begin(SHT31_I2C_ADDR)) {
-    hasRealSHT31 = true;
-    Serial.println("✅ [Hardware] Cam bien nhiet am SHT31 san sang!");
+  // 4. Khởi tạo Cảm biến Áp suất BMP280 (Hỗ trợ cả 2 địa chỉ 0x76 và 0x77)
+  if (bmp.begin(0x76) || bmp.begin(0x77)) {
+    hasRealBMP = true;
+    Serial.println("✅ [Hardware] Cam bien ap suat BMP280 san sang (I2C)!");
+    // Cài đặt tối ưu cho đo thời tiết / kho hàng
+    bmp.setSampling(Adafruit_BMP280::MODE_NORMAL,
+                    Adafruit_BMP280::SAMPLING_X2,
+                    Adafruit_BMP280::SAMPLING_X16,
+                    Adafruit_BMP280::FILTER_X16,
+                    Adafruit_BMP280::STANDBY_MS_500);
   } else {
-    Serial.println("⚠️ [Hardware] Khong tim thay SHT31! Tu dong chay Che Do Gia Lap Test an toan.");
+    Serial.println("⚠️ [Hardware] Khong tim thay BMP280 (Se dung gia lap ap suat tieu chuan).");
   }
 
   // 5. Cấu hình MQTT Client
   mqttClient.setServer(MQTT_SERVER_IP, MQTT_SERVER_PORT);
   mqttClient.setCallback(handleIncomingCommand);
-  mqttClient.setBufferSize(768); // Tăng kích thước buffer nhận/gửi JSON
+  mqttClient.setBufferSize(768);
 
-  // 6. Kết nối Wi-Fi ban đầu
+  // 6. Kết nối Wi-Fi & MQTT
   connectWiFi();
   connectMQTT();
 }
@@ -467,7 +436,7 @@ void setup() {
 void loop() {
   unsigned long currentMillis = millis();
 
-  // A. Duy trì kết nối Wi-Fi và MQTT mỗi 5 giây nếu bị rớt mạng
+  // A. Tự động kết nối lại Wi-Fi và MQTT mỗi 5 giây nếu mất mạng
   if (currentMillis - lastMqttRetryTime >= 5000) {
     lastMqttRetryTime = currentMillis;
     if (WiFi.status() != WL_CONNECTED) {
@@ -477,25 +446,19 @@ void loop() {
     }
   }
 
-  // B. Giữ nhịp MQTT Client loop
+  // B. Giữ nhịp MQTT Client loop lắng nghe lệnh từ Broker
   if (mqttClient.connected()) {
     mqttClient.loop();
   }
 
-  // C. Đọc cảm biến định kỳ và gửi Telemetry
+  // C. Đọc cảm biến định kỳ và gửi Telemetry (Mặc định mỗi 3000ms)
   if (currentMillis - lastTelemetryTime >= samplingIntervalMs) {
     lastTelemetryTime = currentMillis;
     readSensors();
     sendTelemetry();
   }
 
-  // D. Cập nhật màn hình OLED mỗi 1 giây
-  if (currentMillis - lastDisplayTime >= 1000) {
-    lastDisplayTime = currentMillis;
-    updateOLEDDisplay();
-  }
-
-  // E. Gửi Heartbeat định kỳ mỗi 30 giây để duy trì Online
+  // D. Gửi Heartbeat định kỳ mỗi 30 giây để duy trì Online
   if (currentMillis - lastStatusHeartbeatTime >= 30000) {
     lastStatusHeartbeatTime = currentMillis;
     sendStatusHeartbeat();

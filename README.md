@@ -174,6 +174,61 @@ flowchart TD
     end
 ```
 
+### 🔍 Thuyết Minh Chi Tiết 5 Giai Đoạn Vận Hành Của Firmware:
+
+#### 1. Giai đoạn Khởi tạo phần cứng & Mạng (`setup()`)
+* **Cấu hình GPIO:**
+  * `PIN_RELAY_FAN` (GPIO `26`): Thiết lập làm `OUTPUT` (Kênh 1 điều khiển Quạt 5V).
+  * `PIN_RELAY_BUZZER` (GPIO `25`): Thiết lập làm `OUTPUT` (Kênh 2 điều khiển Còi 5V).
+  * `PIN_DOOR_SENSOR` (GPIO `27`): Thiết lập làm `INPUT` (Đọc tín hiệu từ cảm biến cửa Hall A3122 có trở kéo xuống $10\text{k}\Omega$).
+  * Kéo 2 chân Relay về trạng thái ban đầu: Tắt Quạt, Tắt Còi.
+* **Khởi tạo I2C Bus (`Wire.begin(21, 22)`):**
+  * Quét cảm biến nhiệt ẩm **AHT20** (`0x38`). Nếu chưa cắm phần cứng thật, cờ `hasRealAHT = false` sẽ kích hoạt **Zero-Wiring Test Mode** sinh dữ liệu an toàn.
+  * Quét cảm biến áp suất **BMP280** (hỗ trợ cả 2 địa chỉ `0x76` và `0x77`), thiết lập bộ lọc số `FILTER_X16` và tần số lấy mẫu tối ưu.
+* **Kết nối truyền thông & Đăng ký LWT:**
+  * Kết nối Wi-Fi `VT_VN`, nhận cấp phát địa chỉ IP nội bộ.
+  * Kết nối Mosquitto MQTT Broker tại `10.250.190.42:1883`, đăng ký bản tin `Last Will and Testament (LWT)` để Broker tự động thông báo `OFFLINE` nếu ESP32 bị mất điện đột ngột.
+  * Đăng ký kênh nhận lệnh điều khiển: `grain/devices/DEV_SILO_01/cmd`.
+  * Phát bản tin Heartbeat đầu tiên báo trạng thái `ONLINE` lên `.../status`.
+
+---
+
+#### 2. Vòng lặp đa nhiệm không nghẽn (`loop()`)
+Toàn bộ chu trình vận hành được điều phối theo kiến trúc **Non-blocking (Bất đồng bộ)** thông qua hàm đếm thời gian thực `millis()`, hoàn toàn không dùng `delay()`:
+* **Tác vụ 1 (Mỗi 5s):** Giám sát trạng thái mạng. Nếu mất sóng Wi-Fi hoặc đứt kết nối MQTT, tự động kích hoạt tiến trình kết nối lại ngầm mà không làm treo hệ thống.
+* **Tác vụ 2 (Liên tục):** Gọi `mqttClient.loop()` để duy trì phiên làm việc và bắt ngay lập tức các bản tin điều khiển từ Web Dashboard gửi xuống.
+* **Tác vụ 3 (Mỗi 3s):** Kích hoạt chu kỳ đọc đồng thời 4 cảm biến, tính toán vi khí hậu và đẩy Telemetry.
+* **Tác vụ 4 (Mỗi 30s):** Gửi bản tin Heartbeat định kỳ duy trì trạng thái hoạt động trên máy chủ.
+
+---
+
+#### 3. Thuật toán đọc cảm biến & Tự chủ tại biên (`readSensors()`)
+Hệ thống tiến hành thu thập và xử lý toàn diện các thông số vi khí hậu và an ninh:
+1. **Nhiệt độ & Độ ẩm:** Đọc chính xác từ **AHT20** ($\pm 0.3^\circ\text{C}$, $\pm 2\%\text{RH}$).
+2. **Áp suất khí quyển:** Đọc từ **BMP280**, quy đổi sang đơn vị $hPa$ chuẩn để theo dõi tình trạng kín khí của Silo.
+3. **Khí Gas lên men:** Đọc điện áp Analog từ **MQ-135** qua kênh ADC1 (GPIO `34`), phát hiện sớm quá trình hô hấp kỵ khí và thối mốc hạt.
+4. **Cảm biến Cửa kho (Hall A3122):** Đọc mức logic Digital từ chân GPIO `27` để xác định cửa kho đang **ĐÓNG** hay **MỞ**.
+5. **Tính toán độ ẩm hạt Halsey EMC:** Giải phương trình nhiệt ẩm cân bằng hạt theo TCVN 8370:2018.
+6. **Cơ chế tự chủ tại biên (Edge Autonomous Fallback):**
+   * Nếu phát hiện rủi ro `HIGH_RISK` (nhiệt ẩm/khí gas vượt ngưỡng đỏ): Kích hoạt Relay Kênh 2 (**GPIO 25**) hú còi báo động khẩn cấp.
+   * Nếu ở chế độ `AUTO` và có cảnh báo ẩm mốc (`WARNING` hoặc `HIGH_RISK`): Tự động kích hoạt Relay Kênh 1 (**GPIO 26**) đóng tiếp điểm bật quạt thông gió ngay tại chỗ mà không cần chờ lệnh từ Server (giúp bảo vệ kho thóc an toàn ngay cả khi mất mạng Wi-Fi).
+
+---
+
+#### 4. Đóng gói JSON & Gửi Telemetry (`sendTelemetry()`)
+* Đóng gói toàn bộ chỉ số vào bản tin JSON chuẩn ArduinoJson v7.
+* Bổ sung đầy đủ 2 thông số mới: `pressure` ($hPa$) và `door_sensor` (`OPEN`/`CLOSED`).
+* Publish trực tiếp lên topic: **`grain/devices/DEV_SILO_01/telemetry`**.
+
+---
+
+#### 5. Nhận lệnh điều khiển từ xa & Phản hồi xác nhận (`handleIncomingCommand()`)
+* Khi người vận hành bấm nút trên Web Dashboard, máy chủ publish lệnh xuống topic **`grain/devices/DEV_SILO_01/cmd`**.
+* Hàm callback giải mã JSON và thực hiện gạt Relay tương ứng:
+  * Bật/Tắt Quạt: Chuyển mức logic chân Relay K1 (**GPIO 26**).
+  * Bật/Tắt Còi: Chuyển mức logic chân Relay K2 (**GPIO 25**).
+* Tự động phản hồi bản tin xác nhận **ACK** lên topic **`grain/devices/DEV_SILO_01/ack`** kèm trạng thái thực tế sau 300ms, giúp giao diện Web cập nhật công tắc tức thì.
+
 ---
 
 ## ⚡ 5. Quy Trình Giao Tiếp MQTT & Điều Khiển (Sequence Diagram)

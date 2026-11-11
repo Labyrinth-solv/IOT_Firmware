@@ -19,34 +19,39 @@
 // 2. ĐỊNH DANH THIẾT BỊ (DEVICE IDENTITY & PROVISIONING)
 // =============================================================================
 #define DEVICE_ID           "DEV_SILO_01"
-#define FIRMWARE_VERSION    "1.1.0"
+#define FIRMWARE_VERSION    "1.1.1"
 #define HARDWARE_VERSION    "ESP32-WROOM-32D-v2"
 
 // Chu kỳ lấy mẫu và gửi bản tin Telemetry mặc định (ms)
 #define DEFAULT_SAMPLING_INTERVAL_MS 3000
 
 // =============================================================================
-// 3. SƠ ĐỒ ĐẤU NỐI CHÂN GPIO (HARDWARE PINOUT KHỚP SƠ ĐỒ LẮP MẠCH THỰC TẾ)
+// 3. SƠ ĐỒ ĐẤU NỐI CHÂN GPIO (KHỚP BẢNG ĐẤU NỐI THỰC TẾ)
 // =============================================================================
-// Bus I2C dùng chung cho Cảm biến AHT20 và BMP280
+// Cảm biến nhiệt độ & độ ẩm AHT20 (Nguồn 3.3V ESP32, Bus I2C địa chỉ 0x38)
 #define PIN_I2C_SDA         21
 #define PIN_I2C_SCL         22
 
-// Cảm biến chất lượng không khí & khí Gas lên men MQ-135
-// Chân AO nối vào GPIO 34 (kênh ADC1 an toàn khi bật Wi-Fi)
+// Cảm biến chất lượng không khí & khí Gas MQ-135 (Nguồn 5V)
+// Chân AO qua cầu chia áp (15kΩ + 10kΩ) -> GPIO 34 (ADC1 an toàn khi bật Wi-Fi)
+// Điện áp tối đa sau cầu chia áp: 5V * 10/(15+10) = 2.0V -> rawADC ~ 2482
 #define PIN_MQ135_ANALOG    34
+#define MQ135_ADC_MAX       2482
 
-// Cảm biến cửa kho (Hall Sensor A3122)
-// Chân OUT nối vào GPIO 27 (kèm điện trở kéo xuống 10k ohm về GND)
+// Cảm biến từ cửa kho (D0 -> GPIO 27, VCC -> 3.3V nếu có, GND -> GND)
 #define PIN_DOOR_SENSOR     27
-// Trạng thái mức logic khi CỬA MỞ (với trở kéo xuống 10k: HIGH = Hở mạch/Mở cửa)
+// Dùng INPUT_PULLUP để chống nhiễu cho cả module D0 và công tắc từ 2 dây nối GND
+// (Nếu dùng mạch có điện trở kéo xuống 10kΩ ngoài, đổi thành INPUT)
+#define DOOR_PIN_MODE       INPUT_PULLUP
+// Trạng thái logic khi CỬA MỞ (đổi thành LOW nếu cảm biến xuất LOW khi mở cửa)
 #define DOOR_STATE_OPEN_LOGIC HIGH
 
-// Module Relay 2 kênh 5VDC:
-// - Kênh 1: Điều khiển Quạt thông gió 5V
-#define PIN_RELAY_FAN       26
-// - Kênh 2: Điều khiển Còi báo động 5V
-#define PIN_RELAY_BUZZER    25
+// Module Relay 2 kênh 5VDC (Nguồn 5V tổ ong, GND chung):
+// - Kênh 1 (IN1): Điều khiển Quạt 5V qua tiếp điểm COM1 - NO1
+#define PIN_RELAY_FAN       25
+// - Kênh 2 (IN2): Điều khiển Còi 5V qua tiếp điểm COM2 - NO2
+//   (Theo Bảng 2 & 5 dùng GPIO 33; nếu dây thực tế cắm ở GPIO 26 như Bảng 4 thì đổi thành 26)
+#define PIN_RELAY_BUZZER    33
 
 // Mức kích hoạt Module Relay (Đa số module Relay 5V kích mức LOW = LOW_LEVEL_TRIGGER)
 // Nếu module của bạn kích mức HIGH, hãy đổi thành HIGH
